@@ -1,0 +1,14 @@
+# EMIS Data Warehouse — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# PostgreSQL adapter
+psycopg2-binary==2.9.9
+
+# GCP Secret Manager (production secrets)
+google-cloud-secret-manager==2.20.0
+
+# GCP Cloud SQL connector (recommended for Cloud SQL on GCP)
+cloud-sql-python-connector[pg8000]==1.9.0
+
+# Environment variable loading (local dev)
+python-dotenv==1.0.1

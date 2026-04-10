@@ -1,0 +1,57 @@
+name: EMIS DW — Validate & Lint
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 black
+
+      - name: flake8 lint
+        run: flake8 python/ --max-line-length=110 --ignore=E501,W503
+
+      - name: black format check
+        run: black --check python/
+
+  validate-sql:
+    name: Validate SQL files exist and are non-empty
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check all expected SQL files are present
+        run: |
+          for f in \
+            sql/01_schemas/create_schemas.sql \
+            sql/02_staging/create_staging_tables.sql \
+            sql/03_dw/create_dw_tables.sql \
+            sql/03_dw/populate_date_dim.sql \
+            sql/04_audit/create_audit_tables.sql \
+            sql/05_etl/01_flatten_schools.sql \
+            sql/05_etl/02_scd2_schools_dim.sql \
+            sql/05_etl/03_load_school_fact.sql \
+            sql/05_etl/04_scd2_admin_units_dim.sql; do
+            if [ ! -s "$f" ]; then
+              echo "MISSING or EMPTY: $f"
+              exit 1
+            else
+              echo "OK: $f"
+            fi
+          done
