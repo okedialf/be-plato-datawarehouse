@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS dw.schools_dim (
     name                VARCHAR(255),
     admin_unit_id       INTEGER,
     emis_number         VARCHAR(50),
-    school_type         VARCHAR(30),
+    school_type         VARCHAR(50),
     operational_status  VARCHAR(20),
     ownership_status    VARCHAR(60),
     funding_type        VARCHAR(20),
