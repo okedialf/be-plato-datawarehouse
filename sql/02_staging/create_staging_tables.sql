@@ -1,12 +1,13 @@
 -- =============================================================================
 -- EMIS Data Warehouse: Staging Tables
 -- Run once to create. Truncated and reloaded nightly by the ETL.
+--
+-- Fixes applied during testing (2026-04):
+--   - school_type changed from VARCHAR(30) to VARCHAR(50)
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
 -- 1. stg.schools_raw
---    Direct 1:1 copy of public.schools from the OLTP database.
---    Truncated and fully refreshed every night.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS stg.schools_raw (
     id                                   BIGINT,
@@ -72,8 +73,8 @@ COMMENT ON TABLE stg.schools_raw IS 'Raw extract of public.schools from OLTP. Fu
 
 -- -----------------------------------------------------------------------------
 -- 2. stg.schools_flat
---    Flattened, decoded staging table. Built from schools_raw + lookup joins.
---    Truncated and rebuilt each night before SCD2 load into dw.schools_dim.
+--    NOTE: school_type is VARCHAR(50) — full names like
+--    "CERTIFICATE AWARDING INSTITUTION" exceed 30 chars.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS stg.schools_flat (
     id                  SERIAL         NOT NULL,
@@ -97,16 +98,14 @@ CREATE TABLE IF NOT EXISTS stg.schools_flat (
     CONSTRAINT schools_flat_pkey PRIMARY KEY (id),
     CONSTRAINT schools_flat_emis_number_unique UNIQUE (emis_number)
 );
-COMMENT ON TABLE  stg.schools_flat                IS 'Flattened and decoded staging table built nightly from schools_raw + lookup joins. Source for dw.schools_dim SCD2 load.';
-COMMENT ON COLUMN stg.schools_flat.source_id      IS 'PK from the OLTP schools table';
-COMMENT ON COLUMN stg.schools_flat.admin_unit_id  IS 'Best available admin unit id (parish preferred). Raw OLTP id — resolved to DW surrogate during DW load.';
-COMMENT ON COLUMN stg.schools_flat.change_hash    IS 'MD5 over tracked SCD2 columns. Set during DW load step.';
+COMMENT ON TABLE  stg.schools_flat               IS 'Flattened and decoded staging table built nightly. Source for dw.schools_dim SCD2 load.';
+COMMENT ON COLUMN stg.schools_flat.source_id     IS 'PK from the OLTP schools table';
+COMMENT ON COLUMN stg.schools_flat.admin_unit_id IS 'Best available admin unit id resolved against dw.admin_units_dim. Falls back from parish → sub_county → county → district → region.';
+COMMENT ON COLUMN stg.schools_flat.school_type   IS 'PREPRIMARY, PRIMARY, SECONDARY, CERTIFICATE AWARDING INSTITUTION, DIPLOMA AWARDING INSTITUTION, DEGREE AWARDING INSTITUTION, INTERNATIONAL';
 
 
 -- -----------------------------------------------------------------------------
 -- 3. stg.admin_units_raw
---    Raw extract of administrative_units.admin_units from OLTP.
---    Loaded manually or when admin boundaries change (not nightly).
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS stg.admin_units_raw (
     id               SERIAL        NOT NULL,
@@ -121,15 +120,13 @@ CREATE TABLE IF NOT EXISTS stg.admin_units_raw (
     source_id        INTEGER       NOT NULL,
     CONSTRAINT admin_units_raw_pkey PRIMARY KEY (id)
 );
-COMMENT ON TABLE  stg.admin_units_raw              IS 'Raw admin units from OLTP. Loaded manually; only refreshed when boundary changes occur.';
-COMMENT ON COLUMN stg.admin_units_raw.parent_id    IS 'FK to parent admin unit (e.g. district → region)';
-COMMENT ON COLUMN stg.admin_units_raw.source_id    IS 'PK from the OLTP admin_units table';
+COMMENT ON TABLE  stg.admin_units_raw           IS 'Raw admin units from OLTP. Loaded manually; only refreshed when boundary changes occur.';
+COMMENT ON COLUMN stg.admin_units_raw.parent_id IS 'FK to parent admin unit source_id';
+COMMENT ON COLUMN stg.admin_units_raw.source_id IS 'PK from the OLTP admin_units table';
 
 
 -- -----------------------------------------------------------------------------
 -- 4. stg.school_location_details_raw
---    Raw extract of school_location_details from OLTP.
---    Refreshed nightly alongside schools_raw.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS stg.school_location_details_raw (
     id               BIGINT        NOT NULL,
@@ -145,7 +142,4 @@ CREATE TABLE IF NOT EXISTS stg.school_location_details_raw (
     date_created     DATE          NOT NULL DEFAULT CURRENT_DATE,
     CONSTRAINT school_location_details_raw_pkey PRIMARY KEY (id)
 );
-COMMENT ON TABLE  stg.school_location_details_raw               IS 'Raw location data from OLTP. Full refresh nightly.';
-COMMENT ON COLUMN stg.school_location_details_raw.admin_unit_id IS 'FK from admin_units at parish level';
-COMMENT ON COLUMN stg.school_location_details_raw.latitude      IS 'Latitude coordinates of institution location';
-COMMENT ON COLUMN stg.school_location_details_raw.longitude     IS 'Longitude coordinates of institution location';
+COMMENT ON TABLE  stg.school_location_details_raw IS 'Raw location data from OLTP. Full refresh nightly.';

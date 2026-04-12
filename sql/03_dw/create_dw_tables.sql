@@ -1,12 +1,18 @@
 -- =============================================================================
 -- EMIS Data Warehouse: DW Dimension and Fact Tables
 -- Run once on initial setup.
+--
+-- Fixes applied during testing (2026-04):
+--   - school_type changed VARCHAR(30) → VARCHAR(50)
+--   - day column added to date_dim
+--   - UNIQUE constraint added to date_dim.system_date
+--   - child_id made nullable in admin_units_dim (top-level units have no parent)
+--   - Self-referencing FK on admin_units_dim dropped (causes insert ordering issues)
+--   - UNIQUE constraint added to school_fact(school_id, date_id)
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
 -- 1. dw.date_dim
---    Pre-populated for a wide date range (see populate_date_dim.sql).
---    Never truncated after initial load.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS dw.date_dim (
     id              SERIAL        NOT NULL,
@@ -18,24 +24,28 @@ CREATE TABLE IF NOT EXISTS dw.date_dim (
     year            INTEGER       NOT NULL,
     "FY"            INTEGER       NOT NULL,
     "Quarter"       VARCHAR(10)   NOT NULL,
-    CONSTRAINT date_dim_pkey       PRIMARY KEY (id),
+    CONSTRAINT date_dim_pkey        PRIMARY KEY (id),
     CONSTRAINT date_dim_date_unique UNIQUE      (system_date)
 );
-COMMENT ON TABLE  dw.date_dim             IS 'Date dimension. Pre-populated 2010-2040. Never truncated.';
+COMMENT ON TABLE  dw.date_dim             IS 'Date dimension. Pre-populated 2023-2037. Never truncated.';
 COMMENT ON COLUMN dw.date_dim.system_date IS 'Calendar date (one row per day)';
-COMMENT ON COLUMN dw.date_dim."FY"        IS 'Fiscal year (Uganda FY runs Jul-Jun, so Jul 2024 = FY 2025)';
-COMMENT ON COLUMN dw.date_dim."Quarter"   IS 'Fiscal quarter label e.g. Q1, Q2, Q3, Q4';
-COMMENT ON COLUMN dw.date_dim.short_month IS 'Three-letter month abbreviation: JAN, FEB, MAR …';
+COMMENT ON COLUMN dw.date_dim.day         IS 'Day of month (1-31)';
+COMMENT ON COLUMN dw.date_dim."FY"        IS 'Uganda Fiscal Year (Jul-Jun). Jul 2025-Jun 2026 = FY2026';
+COMMENT ON COLUMN dw.date_dim."Quarter"   IS 'Fiscal quarter: Q1=Jul-Sep, Q2=Oct-Dec, Q3=Jan-Mar, Q4=Apr-Jun';
+COMMENT ON COLUMN dw.date_dim.short_month IS 'Three-letter month abbreviation: JAN, FEB, MAR etc.';
 
 
 -- -----------------------------------------------------------------------------
 -- 2. dw.admin_units_dim  (SCD Type 2)
---    One row per admin unit version. current_status = TRUE marks the
---    live version. Loaded manually / on boundary changes.
+--
+--    NOTE: child_id is nullable — top-level units (Country) have no parent.
+--    NOTE: Self-referencing FK on child_id has been removed. The hierarchy
+--          is navigated via admin_unit_type and source_id instead. The FK
+--          caused insert ordering failures during bulk loads.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS dw.admin_units_dim (
     id               SERIAL       NOT NULL,
-    child_id         INTEGER      NOT NULL,
+    child_id         INTEGER,
     admin_unit_type  VARCHAR(50)  NOT NULL,
     name             VARCHAR(60)  NOT NULL,
     admin_unit_code  VARCHAR(255) NOT NULL,
@@ -46,24 +56,20 @@ CREATE TABLE IF NOT EXISTS dw.admin_units_dim (
     source_id        INTEGER      NOT NULL,
     CONSTRAINT admin_units_dim_pkey PRIMARY KEY (id)
 );
-COMMENT ON TABLE  dw.admin_units_dim                  IS 'Admin units SCD2 dimension. One row per version of each admin unit.';
-COMMENT ON COLUMN dw.admin_units_dim.child_id         IS 'Self-referencing FK to child admin unit (for hierarchy traversal)';
-COMMENT ON COLUMN dw.admin_units_dim.admin_unit_type  IS 'REGION, DISTRICT, COUNTY, SUB_COUNTY, PARISH, WARD, VILLAGE …';
-COMMENT ON COLUMN dw.admin_units_dim.source_id        IS 'PK from the OLTP admin_units table';
-COMMENT ON COLUMN dw.admin_units_dim.effective_date   IS 'Date this version became effective';
-COMMENT ON COLUMN dw.admin_units_dim.expiration_date  IS 'Date this version expired. 9999-12-31 = still current';
-COMMENT ON COLUMN dw.admin_units_dim.current_status   IS 'TRUE = this is the current active version';
-
-ALTER TABLE dw.admin_units_dim
-    ADD CONSTRAINT admin_units_dim_child_id_foreign
-    FOREIGN KEY (child_id) REFERENCES dw.admin_units_dim (id)
-    DEFERRABLE INITIALLY DEFERRED;
+COMMENT ON TABLE  dw.admin_units_dim                 IS 'Admin units SCD2 dimension. One row per version of each admin unit.';
+COMMENT ON COLUMN dw.admin_units_dim.child_id        IS 'Source_id of the parent admin unit. NULL for top-level (Country).';
+COMMENT ON COLUMN dw.admin_units_dim.admin_unit_type IS 'REGION, DISTRICT, COUNTY, SUB_COUNTY, PARISH, WARD, VILLAGE etc.';
+COMMENT ON COLUMN dw.admin_units_dim.source_id       IS 'PK from the OLTP admin_units table';
+COMMENT ON COLUMN dw.admin_units_dim.effective_date  IS 'Date this version became effective';
+COMMENT ON COLUMN dw.admin_units_dim.expiration_date IS 'Date this version expired. 9999-12-31 = still current';
+COMMENT ON COLUMN dw.admin_units_dim.current_status  IS 'TRUE = this is the current active version';
 
 
 -- -----------------------------------------------------------------------------
 -- 3. dw.schools_dim  (SCD Type 2)
---    One row per school attribute-version. is_current = TRUE marks the
---    live version. Loaded nightly via SCD2 upsert.
+--
+--    NOTE: school_type is VARCHAR(50) — full names like
+--    "CERTIFICATE AWARDING INSTITUTION" exceed 30 chars.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS dw.schools_dim (
     id                  SERIAL       NOT NULL,
@@ -84,13 +90,12 @@ CREATE TABLE IF NOT EXISTS dw.schools_dim (
     change_hash         TEXT         NOT NULL,
     change_reason       TEXT         NOT NULL,
     changed_fields      TEXT         NOT NULL,
-    CONSTRAINT schools_dim_pkey               PRIMARY KEY (id)
+    CONSTRAINT schools_dim_pkey PRIMARY KEY (id)
 );
-COMMENT ON TABLE  dw.schools_dim                 IS 'Schools SCD2 dimension. One row per school attribute-version.';
-COMMENT ON COLUMN dw.schools_dim.source_id       IS 'PK from OLTP schools table — the natural key';
-COMMENT ON COLUMN dw.schools_dim.admin_unit_id   IS 'FK → dw.admin_units_dim(id). DW surrogate for the effective admin unit version';
-COMMENT ON COLUMN dw.schools_dim.emis_number     IS 'EMIS number: level-code + alpha + 6-digit number. Unique per live school.';
-COMMENT ON COLUMN dw.schools_dim.school_type     IS 'PREPRIMARY, PRIMARY, SECONDARY, CERTIFICATE, DIPLOMA, DEGREE, INTERNATIONAL';
+COMMENT ON TABLE  dw.schools_dim                    IS 'Schools SCD2 dimension. One row per school attribute-version.';
+COMMENT ON COLUMN dw.schools_dim.source_id          IS 'PK from OLTP schools table — the natural key';
+COMMENT ON COLUMN dw.schools_dim.admin_unit_id      IS 'FK → dw.admin_units_dim(id). DW surrogate for the effective admin unit version';
+COMMENT ON COLUMN dw.schools_dim.school_type        IS 'PREPRIMARY, PRIMARY, SECONDARY, CERTIFICATE AWARDING INSTITUTION, DIPLOMA AWARDING INSTITUTION, DEGREE AWARDING INSTITUTION, INTERNATIONAL';
 COMMENT ON COLUMN dw.schools_dim.operational_status IS 'ACTIVE, SUSPENDED, CLOSED';
 COMMENT ON COLUMN dw.schools_dim.ownership_status   IS 'SOLE PROPRIETOR, LEGAL PARTNERSHIP, PUBLIC LIMITED COMPANY etc.';
 COMMENT ON COLUMN dw.schools_dim.funding_type       IS 'GOVT AIDED, PRIVATE';
@@ -100,9 +105,9 @@ COMMENT ON COLUMN dw.schools_dim.founding_body_type IS 'GOVERNMENT, ANGLICAN, RO
 COMMENT ON COLUMN dw.schools_dim.effective_date     IS 'Date this SCD2 row became effective';
 COMMENT ON COLUMN dw.schools_dim.expiration_date    IS 'Date this SCD2 row expired. 9999-12-31 = still current';
 COMMENT ON COLUMN dw.schools_dim.is_current         IS 'TRUE = this is the current version of the school record';
-COMMENT ON COLUMN dw.schools_dim.change_hash        IS 'MD5 hash of all tracked SCD2 columns. Hash diff triggers new SCD2 version.';
-COMMENT ON COLUMN dw.schools_dim.change_reason      IS 'Human-readable reason for SCD2 version creation (e.g. "School renamed")';
-COMMENT ON COLUMN dw.schools_dim.changed_fields     IS 'Comma-separated list of column names that changed in this version';
+COMMENT ON COLUMN dw.schools_dim.change_hash        IS 'MD5 hash of all tracked SCD2 columns. Hash diff triggers new version.';
+COMMENT ON COLUMN dw.schools_dim.change_reason      IS 'Human-readable reason e.g. "School renamed"';
+COMMENT ON COLUMN dw.schools_dim.changed_fields     IS 'Comma-separated list of column names that changed';
 
 ALTER TABLE dw.schools_dim
     ADD CONSTRAINT schools_dim_admin_unit_id_foreign
@@ -111,7 +116,6 @@ ALTER TABLE dw.schools_dim
 
 -- -----------------------------------------------------------------------------
 -- 4. dw.school_location_details_dim  (SCD Type 2)
---    Tracks historical school location changes.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS dw.school_location_details_dim (
     id               INTEGER      NOT NULL,
@@ -127,13 +131,7 @@ CREATE TABLE IF NOT EXISTS dw.school_location_details_dim (
     date_created     DATE,
     CONSTRAINT school_location_details_dim_pkey PRIMARY KEY (id)
 );
-COMMENT ON TABLE  dw.school_location_details_dim               IS 'School location SCD2 dimension. Tracks address and coordinate history.';
-COMMENT ON COLUMN dw.school_location_details_dim.school_id     IS 'FK → dw.schools_dim(id)';
-COMMENT ON COLUMN dw.school_location_details_dim.admin_unit_id IS 'FK → dw.admin_units_dim(id) at parish level';
-COMMENT ON COLUMN dw.school_location_details_dim.latitude      IS 'Latitude of school location';
-COMMENT ON COLUMN dw.school_location_details_dim.longitude     IS 'Longitude of school location';
-COMMENT ON COLUMN dw.school_location_details_dim.effective_date IS 'Date this location record became effective';
-COMMENT ON COLUMN dw.school_location_details_dim.expiration_date IS '9999-12-31 = current location';
+COMMENT ON TABLE  dw.school_location_details_dim IS 'School location SCD2 dimension. Tracks address and coordinate history.';
 
 ALTER TABLE dw.school_location_details_dim
     ADD CONSTRAINT school_location_dim_school_id_foreign
@@ -146,18 +144,19 @@ ALTER TABLE dw.school_location_details_dim
 
 -- -----------------------------------------------------------------------------
 -- 5. dw.school_fact  (Daily snapshot)
---    One row per school per day. Joined to current SCD2 dimension rows
---    at load time so slicing by school attributes is via dimension join.
+--
+--    NOTE: UNIQUE constraint on (school_id, date_id) prevents duplicate
+--    snapshots and enables ON CONFLICT DO NOTHING for safe re-runs.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS dw.school_fact (
     id            SERIAL    NOT NULL,
     school_id     INTEGER   NOT NULL,
     date_id       INTEGER   NOT NULL,
     location_time TIMESTAMP(0) WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP(0),
-    CONSTRAINT school_fact_pkey                PRIMARY KEY (id),
-    CONSTRAINT school_fact_school_date_unique  UNIQUE      (school_id, date_id)
+    CONSTRAINT school_fact_pkey               PRIMARY KEY (id),
+    CONSTRAINT school_fact_school_date_unique UNIQUE      (school_id, date_id)
 );
-COMMENT ON TABLE  dw.school_fact               IS 'Daily school snapshot fact. One row per school per day. Enables COUNT(*) reports across any dimension.';
+COMMENT ON TABLE  dw.school_fact               IS 'Daily school snapshot fact. One row per school per day.';
 COMMENT ON COLUMN dw.school_fact.school_id     IS 'FK → dw.schools_dim(id). Points to the SCD2 row valid on that date.';
 COMMENT ON COLUMN dw.school_fact.date_id       IS 'FK → dw.date_dim(id). Daily granularity.';
 COMMENT ON COLUMN dw.school_fact.location_time IS 'ETL load timestamp';
@@ -172,7 +171,7 @@ ALTER TABLE dw.school_fact
 
 
 -- -----------------------------------------------------------------------------
--- Indexes for common query patterns
+-- Indexes
 -- -----------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_schools_dim_source_id_current
     ON dw.schools_dim (source_id, is_current);
