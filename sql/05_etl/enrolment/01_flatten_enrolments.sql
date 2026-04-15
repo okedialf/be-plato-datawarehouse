@@ -1,8 +1,17 @@
 -- =============================================================================
--- EMIS Enrolment Mart ETL: Step 1 — Flatten Enrolments
+-- EMIS Enrolment Mart ETL: Step 1 — Flatten Enrolments (GCP Testing Version)
 -- Joins all raw staging tables into stg.enrolments_flat.
--- Decodes all lookup IDs to business terms.
--- Derives disability flags, orphan status, enrolment type, age.
+--
+-- KEY CORRECTIONS from data dictionary review:
+--   Academic year decoded from setting_academic_years.name (e.g. "2025")
+--   Teaching period from setting_teaching_periods.name
+--   Orphan status from learners.is_father_dead + learners.is_mother_dead
+--   Enrolment type from learner_enrolments.enrolment_type_id → setting_enrolment_types
+--   Repeater from learner_enrolments.is_repeating_yn
+--   Returnee from learner_enrolments.is_returning_yn
+--   Grade and school level from stg.enrolments_subtype_raw (decoded in step 0)
+--   School attributes from public.schools + setting_* lookup tables
+--   Admin unit: COALESCE(parish_id, sub_county_id, county_id, district_id, region_id)
 -- =============================================================================
 
 BEGIN;
@@ -46,24 +55,33 @@ INSERT INTO stg.enrolments_flat (
     admin_unit_source_id
 )
 SELECT
-    e.id                                                        AS enrolment_source_id,
-    e.learner_id                                                AS learner_source_id,
-    e.school_id                                                 AS school_source_id,
+    e.id::TEXT::UUID                                AS enrolment_source_id,
+    e.learner_id                                    AS learner_source_id,
+    e.school_id::TEXT::UUID                         AS school_source_id,
 
-    -- Decode academic year and term
-    ay.year::INTEGER                                            AS academic_year,
-    CASE tp.name
-        WHEN '1' THEN 'TERM 1'
-        WHEN '2' THEN 'TERM 2'
-        WHEN '3' THEN 'TERM 3'
-        ELSE COALESCE('TERM '||tp.name, 'TERM 1')
-    END                                                         AS term,
+    -- Academic year: extract 4-digit year from setting_academic_years.name
+    -- Name is typically "2025" or "2024/2025" — take the last 4 digits
+    COALESCE(
+        NULLIF(REGEXP_REPLACE(ay.name, '[^0-9]', '', 'g'), '')::INTEGER,
+        EXTRACT(YEAR FROM CURRENT_DATE)::INTEGER
+    )                                               AS academic_year,
 
-    -- Learner attributes
+    -- Teaching period: name is "1", "2", "3" — prefix with TERM
+    CASE
+        WHEN tp.name IN ('1','2','3') THEN 'TERM ' || tp.name
+        WHEN tp.name ILIKE 'TERM%'   THEN UPPER(tp.name)
+        ELSE 'TERM 1'
+    END                                             AS term,
+
+    -- Learner attributes from stg.learners_raw
     lr.lin,
     lr.gender,
-    EXTRACT(YEAR FROM CURRENT_DATE)::INTEGER
-        - EXTRACT(YEAR FROM lr.date_of_birth)::INTEGER          AS age,
+    CASE
+        WHEN lr.date_of_birth IS NOT NULL
+        THEN EXTRACT(YEAR FROM CURRENT_DATE)::INTEGER
+             - EXTRACT(YEAR FROM lr.date_of_birth)::INTEGER
+        ELSE NULL
+    END                                             AS age,
     lr.nationality,
     lr.nin,
     lr.passport_no,
@@ -71,27 +89,23 @@ SELECT
     lr.work_permit_no,
     lr.refugee_id,
 
-    -- Orphan status: derived from learner_health or direct flag
-    -- NOTE: orphan_status is stored in src.learner_health_issues or
-    -- src.learner_parents; adapt to exact EMIS 2.0 source column.
-    -- For now mapped from promotion_status as a proxy pending source clarification.
+    -- Orphan status: from learners table directly
+    -- learners.is_father_dead and learners.is_mother_dead
     CASE
-        WHEN lh.is_double_orphan_yn IS TRUE             THEN 'BOTH DECEASED'
-        WHEN lh.is_father_deceased_yn IS TRUE
-         AND lh.is_mother_deceased_yn IS TRUE            THEN 'BOTH DECEASED'
-        WHEN lh.is_mother_deceased_yn IS TRUE            THEN 'MOTHER DECEASED'
-        WHEN lh.is_father_deceased_yn IS TRUE            THEN 'FATHER DECEASED'
+        WHEN l_src.is_father_dead = TRUE
+         AND l_src.is_mother_dead = TRUE THEN 'BOTH DECEASED'
+        WHEN l_src.is_mother_dead = TRUE  THEN 'MOTHER DECEASED'
+        WHEN l_src.is_father_dead = TRUE  THEN 'FATHER DECEASED'
         ELSE 'NOT APPLICABLE'
-    END                                                         AS orphan_status,
+    END                                             AS orphan_status,
 
-    -- Disability flags (aggregated from learner_disabilities_raw)
-    COALESCE(dis.is_visual_yn,         FALSE)                   AS is_visual_yn,
-    COALESCE(dis.is_hearing_yn,        FALSE)                   AS is_hearing_yn,
-    COALESCE(dis.is_walking_yn,        FALSE)                   AS is_walking_yn,
-    COALESCE(dis.is_self_care_yn,      FALSE)                   AS is_self_care_yn,
-    COALESCE(dis.is_remembering_yn,    FALSE)                   AS is_remembering_yn,
-    COALESCE(dis.is_communication_yn,  FALSE)                   AS is_communication_yn,
-    -- Multiple disabilities = more than one flag is TRUE
+    -- Disability flags aggregated from learner_disabilities_raw
+    COALESCE(dis.is_visual_yn,        FALSE)        AS is_visual_yn,
+    COALESCE(dis.is_hearing_yn,       FALSE)        AS is_hearing_yn,
+    COALESCE(dis.is_walking_yn,       FALSE)        AS is_walking_yn,
+    COALESCE(dis.is_self_care_yn,     FALSE)        AS is_self_care_yn,
+    COALESCE(dis.is_remembering_yn,   FALSE)        AS is_remembering_yn,
+    COALESCE(dis.is_communication_yn, FALSE)        AS is_communication_yn,
     CASE WHEN (
         COALESCE(dis.is_visual_yn,        FALSE)::INT +
         COALESCE(dis.is_hearing_yn,       FALSE)::INT +
@@ -99,117 +113,126 @@ SELECT
         COALESCE(dis.is_self_care_yn,     FALSE)::INT +
         COALESCE(dis.is_remembering_yn,   FALSE)::INT +
         COALESCE(dis.is_communication_yn, FALSE)::INT
-    ) > 1 THEN TRUE ELSE FALSE END                              AS has_multiple_disabilities_yn,
+    ) > 1 THEN TRUE ELSE FALSE END                  AS has_multiple_disabilities_yn,
 
-    -- Grade and school level (from subtype enrolment)
-    sub.education_class_name                                    AS grade,
+    -- Grade and school level from decoded subtype staging
+    sub.education_class_name                        AS grade,
     sub.school_level,
 
-    -- Enrolment type — derived from promotion/transfer/transition status
+    -- Enrolment type: use enrolment_type_id first, then fall back to flags
     CASE
-        WHEN e.learner_transfer_status_id = 1               THEN 'TRANSFER'
-        WHEN e.learner_transition_status_id = 1             THEN 'TRANSFER'
-        WHEN e.learner_promotion_status_id = 2              THEN 'REPEATER'
-        WHEN e.learner_promotion_status_id = 3              THEN 'RETURNEE'
-        WHEN et.name IS NOT NULL                            THEN UPPER(et.name)
+        WHEN le.is_returning_yn = TRUE              THEN 'RETURNEE'
+        WHEN le.is_repeating_yn = TRUE              THEN 'REPEATER'
+        WHEN set_et.name IS NOT NULL                THEN UPPER(set_et.name)
         ELSE 'CONTINUING'
-    END                                                         AS enrolment_type,
+    END                                             AS enrolment_type,
 
-    e.is_enrolment_active_yn                                    AS is_active,
+    e.is_enrolment_active_yn                        AS is_active,
 
-    -- School attributes (denormalized from src)
-    s.emis_number                                               AS school_emis_number,
-    s.name                                                      AS school_name,
-    COALESCE(own.name, CASE WHEN s.is_government_owned_yn THEN 'GOVT AIDED' ELSE 'PRIVATE' END)
-                                                                AS school_ownership,
-    fs.name                                                     AS school_funding_type,
+    -- School attributes
+    s.emis_number                                   AS school_emis_number,
+    s.name                                          AS school_name,
+    COALESCE(sos.name,
+        CASE WHEN s.is_government_owned_yn THEN 'GOVT AIDED'
+             ELSE 'PRIVATE' END)                    AS school_ownership,
+    COALESCE(sfs.name, '')                          AS school_funding_type,
     CASE
-        WHEN s.has_female_students AND s.has_male_students   THEN 'MIXED'
-        WHEN s.has_female_students                           THEN 'FEMALES ONLY'
-        WHEN s.has_male_students                             THEN 'MALES ONLY'
+        WHEN s.has_female_students AND s.has_male_students THEN 'MIXED'
+        WHEN s.has_female_students                         THEN 'FEMALES ONLY'
+        WHEN s.has_male_students                           THEN 'MALES ONLY'
         ELSE NULL
-    END                                                         AS school_sex_composition,
-    -- Boarding status decoded by the existing flatten logic (reuse from schools ETL)
-    brd.boarding_status                                         AS school_boarding_status,
-    st.name                                                     AS school_type,
+    END                                             AS school_sex_composition,
 
-    -- Admin unit (best available — same priority as schools flatten)
+    -- Boarding status from subtype tables
+    CASE
+        WHEN COALESCE(pps.admits_day_scholars_yn, prs.admits_day_scholars_yn,
+                      sec.admits_day_scholars_yn) = TRUE
+         AND COALESCE(pps.admits_boarders_yn, prs.admits_boarders_yn,
+                      sec.admits_boarders_yn) = FALSE
+            THEN 'DAY SCHOOL'
+        WHEN COALESCE(pps.admits_day_scholars_yn, prs.admits_day_scholars_yn,
+                      sec.admits_day_scholars_yn) = FALSE
+         AND COALESCE(pps.admits_boarders_yn, prs.admits_boarders_yn,
+                      sec.admits_boarders_yn) = TRUE
+            THEN 'FULLY BOARDING'
+        WHEN COALESCE(pps.admits_boarders_yn, prs.admits_boarders_yn,
+                      sec.admits_boarders_yn) = TRUE
+         AND COALESCE(pps.admits_day_scholars_yn, prs.admits_day_scholars_yn,
+                      sec.admits_day_scholars_yn) = TRUE
+            THEN 'DAY AND BOARDING'
+        ELSE NULL
+    END                                             AS school_boarding_status,
+
+    COALESCE(sst.name, '')                          AS school_type,
+
+    -- Admin unit: best available level
     COALESCE(
         s.parish_id,
         s.sub_county_id,
         s.county_id,
         s.district_id,
         s.region_id
-    )::INTEGER                                                  AS admin_unit_source_id
+    )::INTEGER                                      AS admin_unit_source_id
 
 FROM stg.enrolments_raw e
 
--- Academic year and term decode
-JOIN src.lkup_academic_years  ay ON ay.id = e.academic_year_id
-JOIN src.lkup_teaching_periods tp ON tp.id = e.teaching_period_id
+-- Decode academic year and teaching period
+JOIN public.setting_academic_years  ay ON ay.id = e.academic_year_id
+JOIN public.setting_teaching_periods tp ON tp.id = e.teaching_period_id
 
--- Learner
+-- Join back to learner_enrolments for enrolment-specific flags
+JOIN public.learner_enrolments le
+    ON le.id = e.id
+
+-- Learner from staging
 JOIN stg.learners_raw lr
     ON lr.person_id = e.learner_id
 
--- Learner health (for orphan status)
-LEFT JOIN src.learner_health_issues lh
-    ON lh.learner_id = e.learner_id
+-- Source learners table for orphan status flags
+JOIN public.learners l_src
+    ON l_src.person_id = e.learner_id
 
 -- Disability flags aggregated per learner
 LEFT JOIN (
     SELECT
         learner_id,
-        BOOL_OR(disability_type = 'VISUAL')        AS is_visual_yn,
-        BOOL_OR(disability_type = 'HEARING')       AS is_hearing_yn,
-        BOOL_OR(disability_type = 'WALKING')       AS is_walking_yn,
-        BOOL_OR(disability_type = 'SELF_CARE')     AS is_self_care_yn,
-        BOOL_OR(disability_type = 'REMEMBERING')   AS is_remembering_yn,
-        BOOL_OR(disability_type = 'COMMUNICATION') AS is_communication_yn
+        BOOL_OR(UPPER(disability_type) LIKE '%VISUAL%')        AS is_visual_yn,
+        BOOL_OR(UPPER(disability_type) LIKE '%HEARING%')       AS is_hearing_yn,
+        BOOL_OR(UPPER(disability_type) LIKE '%WALK%'
+             OR UPPER(disability_type) LIKE '%MOBIL%')         AS is_walking_yn,
+        BOOL_OR(UPPER(disability_type) LIKE '%SELF%CARE%'
+             OR UPPER(disability_type) LIKE '%SELF_CARE%')     AS is_self_care_yn,
+        BOOL_OR(UPPER(disability_type) LIKE '%REMEMBER%'
+             OR UPPER(disability_type) LIKE '%CONCENTRAT%'
+             OR UPPER(disability_type) LIKE '%COGNIT%')        AS is_remembering_yn,
+        BOOL_OR(UPPER(disability_type) LIKE '%COMMUNIC%')      AS is_communication_yn
     FROM stg.learner_disabilities_raw
     GROUP BY learner_id
 ) dis ON dis.learner_id = e.learner_id
 
--- Subtype enrolment (grade/class)
+-- Grade and school level from subtype staging
 LEFT JOIN stg.enrolments_subtype_raw sub
     ON sub.enrolment_id = e.id
 
--- Enrolment type from lookup
-LEFT JOIN src.lkup_enrolment_types et
-    ON et.id = e.reporting_status_id
+-- Enrolment type lookup
+LEFT JOIN public.setting_enrolment_types set_et
+    ON set_et.id = le.enrolment_type_id
 
--- School attributes
-JOIN src.schools s
+-- School
+JOIN public.schools s
     ON s.id = e.school_id
-LEFT JOIN src.setting_school_types        st  ON st.id  = s.school_type_id
-LEFT JOIN src.setting_ownership_statuses  own ON own.id = s.school_ownership_status_id
-LEFT JOIN src.setting_funding_sources     fs  ON fs.id  = s.funding_source_id
+LEFT JOIN public.setting_school_types      sst ON sst.id = s.school_type_id
+LEFT JOIN public.setting_ownership_statuses sos ON sos.id = s.school_ownership_status_id
+LEFT JOIN public.setting_funding_sources    sfs ON sfs.id = s.funding_source_id
 
--- Boarding status derived subquery (same logic as schools flatten)
-LEFT JOIN (
-    SELECT
-        sr.id AS school_id,
-        CASE
-            WHEN pp.school_id IS NOT NULL OR pr.school_id IS NOT NULL
-              OR se2.school_id IS NOT NULL THEN
-                CASE
-                    WHEN COALESCE(pp.admits_day_scholars_yn, pr.admits_day_scholars_yn, se2.admits_day_scholars_yn) IS TRUE
-                     AND COALESCE(pp.admits_boarders_yn,     pr.admits_boarders_yn,     se2.admits_boarders_yn)     IS FALSE
-                        THEN 'DAY SCHOOL'
-                    WHEN COALESCE(pp.admits_day_scholars_yn, pr.admits_day_scholars_yn, se2.admits_day_scholars_yn) IS FALSE
-                     AND COALESCE(pp.admits_boarders_yn,     pr.admits_boarders_yn,     se2.admits_boarders_yn)     IS TRUE
-                        THEN 'FULLY BOARDING'
-                    WHEN COALESCE(pp.admits_day_scholars_yn, pr.admits_day_scholars_yn, se2.admits_day_scholars_yn) IS TRUE
-                     AND COALESCE(pp.admits_boarders_yn,     pr.admits_boarders_yn,     se2.admits_boarders_yn)     IS TRUE
-                        THEN 'DAY AND BOARDING'
-                    ELSE NULL
-                END
-            ELSE NULL
-        END AS boarding_status
-    FROM src.schools sr
-    LEFT JOIN src.pre_primary_schools  pp  ON pp.school_id  = sr.id
-    LEFT JOIN src.primary_schools      pr  ON pr.school_id  = sr.id
-    LEFT JOIN src.secondary_schools    se2 ON se2.school_id = sr.id
-) brd ON brd.school_id = e.school_id;
+-- Boarding status from school subtype tables
+LEFT JOIN public.pre_primary_schools pps ON pps.school_id = s.id
+LEFT JOIN public.primary_schools     prs ON prs.school_id = s.id
+LEFT JOIN public.secondary_schools   sec ON sec.school_id = s.id;
+
+DO $$ DECLARE v BIGINT; BEGIN
+    SELECT COUNT(*) INTO v FROM stg.enrolments_flat;
+    RAISE NOTICE 'stg.enrolments_flat: % rows loaded', v;
+END; $$;
 
 COMMIT;
