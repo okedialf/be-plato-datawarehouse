@@ -55,15 +55,15 @@ INSERT INTO stg.enrolments_flat (
     admin_unit_source_id
 )
 SELECT
-    e.id::TEXT::UUID                                AS enrolment_source_id,
+    e.id                                            AS enrolment_source_id,
     e.learner_id                                    AS learner_source_id,
-    e.school_id::TEXT::UUID                         AS school_source_id,
+    e.school_id                                     AS school_source_id,
 
     -- Academic year: extract 4-digit year from setting_academic_years.name
-    -- Name is typically "2025" or "2024/2025" — take the last 4 digits
+    -- e.g. "ACADEMIC YEAR 2026" → 2026
     COALESCE(
         NULLIF(REGEXP_REPLACE(ay.name, '[^0-9]', '', 'g'), '')::INTEGER,
-        EXTRACT(YEAR FROM CURRENT_DATE)::INTEGER
+        EXTRACT(YEAR FROM aytp.start_date)::INTEGER
     )                                               AS academic_year,
 
     -- Teaching period: name is "1", "2", "3" — prefix with TERM
@@ -178,8 +178,11 @@ SELECT
 FROM stg.enrolments_raw e
 
 -- Decode academic year and teaching period
-JOIN public.setting_academic_years  ay ON ay.id = e.academic_year_id
-JOIN public.setting_teaching_periods tp ON tp.id = e.teaching_period_id
+-- learner_enrolments.teaching_period_id is a FK to academic_year_teaching_periods.id
+-- which links to both setting_academic_years and setting_teaching_periods
+JOIN public.academic_year_teaching_periods aytp ON aytp.id = e.teaching_period_id
+JOIN public.setting_academic_years  ay ON ay.id = aytp.academic_year_id
+JOIN public.setting_teaching_periods tp ON tp.id = aytp.teaching_period_id
 
 -- Join back to learner_enrolments for enrolment-specific flags
 JOIN public.learner_enrolments le

@@ -45,21 +45,21 @@ CREATE TABLE IF NOT EXISTS dw.learner_dim (
     id                          SERIAL        NOT NULL,
 
     -- Natural / business key
-    source_id                   UUID,                     -- learners.person_id from OLTP
+    source_id                   BIGINT,                     -- learners.person_id from OLTP
     lin                         VARCHAR(30),              -- Learner Identification Number
 
     -- Demographic attributes
-    gender                      VARCHAR(10),              -- MALE / FEMALE
+    gender                      VARCHAR(20),              -- MALE / FEMALE
     age_at_load                 INTEGER,                  -- Age computed at ETL load time (point-in-time)
-    nationality                 VARCHAR(100),
-    orphan_status               VARCHAR(30),              -- MOTHER DECEASED / FATHER DECEASED / BOTH DECEASED / NOT APPLICABLE
+    nationality                 VARCHAR(150),
+    orphan_status               VARCHAR(50),              -- MOTHER DECEASED / FATHER DECEASED / BOTH DECEASED / NOT APPLICABLE
 
     -- Identity documents (PII — mask in analytics views)
-    nin                         VARCHAR(14),
-    passport_no                 VARCHAR(20),
-    student_pass_no             VARCHAR(20),
-    work_permit_no              VARCHAR(20),
-    refugee_id                  VARCHAR(20),
+    nin                         VARCHAR(30),
+    passport_no                 VARCHAR(100),
+    student_pass_no             VARCHAR(100),
+    work_permit_no              VARCHAR(100),
+    refugee_id                  VARCHAR(100),
 
     -- Disability flags (SCD2 tracked)
     is_visual_yn                BOOLEAN       DEFAULT FALSE,
@@ -108,8 +108,8 @@ CREATE INDEX IF NOT EXISTS idx_learner_dim_effective
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS dw.grade_dim (
     id              SERIAL        NOT NULL,
-    grade_code      VARCHAR(10)   NOT NULL,   -- P1, P2 ... P7, S1 ... S6, Baby Class etc.
-    grade_name      VARCHAR(50),              -- Primary One, Senior One etc.
+    grade_code      VARCHAR(50)   NOT NULL,   -- P1, P2 ... P7, S1 ... S6, Baby Class etc.
+    grade_name      VARCHAR(100),              -- Primary One, Senior One etc.
     school_level    VARCHAR(50),              -- PRE_PRIMARY, PRIMARY, SECONDARY, TERTIARY
     sort_order      INTEGER,                  -- For ordering P1 < P2 < ... < S6
     CONSTRAINT grade_dim_pkey        PRIMARY KEY (id),
@@ -185,9 +185,9 @@ CREATE TABLE IF NOT EXISTS dw.enrolment_fact (
     enrolment_type_id   INTEGER     NOT NULL,   -- FK → dw.enrolment_type_dim(id)
 
     -- Natural keys retained for deduplication and debugging
-    learner_source_id   UUID,                   -- learners.person_id from OLTP
-    school_source_id    UUID,                   -- schools.id from OLTP
-    enrolment_source_id UUID,                   -- enrolments.id from OLTP
+    learner_source_id   BIGINT,                   -- learners.person_id from OLTP
+    school_source_id    BIGINT,                   -- schools.id from OLTP
+    enrolment_source_id BIGINT,                   -- enrolments.id from OLTP
     academic_year       INTEGER,                -- e.g. 2025
     term                VARCHAR(10),            -- TERM 1, TERM 2, TERM 3
 

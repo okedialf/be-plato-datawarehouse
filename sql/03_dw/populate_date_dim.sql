@@ -1,7 +1,7 @@
 -- =============================================================================
 -- EMIS Data Warehouse: Populate Date Dimension
 -- Run ONCE after create_dw_tables.sql.
--- Covers 2023-01-01 through 2037-12-31 (15 years).
+-- Covers 2022-01-01 through 2037-12-31 (16 years — 2022 needed for historical enrolment data).
 -- Uganda Fiscal Year runs July-June (e.g., Jul 2025-Jun 2026 = FY2026).
 --
 -- Prerequisites:
@@ -31,7 +31,7 @@ SELECT
         WHEN EXTRACT(MONTH FROM d) IN (4,  5,  6)  THEN 'Q4'
     END                                                 AS "Quarter"
 FROM
-    GENERATE_SERIES('2023-01-01'::DATE, '2037-12-31'::DATE, '1 day'::INTERVAL) AS d
+    GENERATE_SERIES('2022-01-01'::DATE, '2037-12-31'::DATE, '1 day'::INTERVAL) AS d
 ON CONFLICT (system_date) DO NOTHING;
 
 -- Verify
