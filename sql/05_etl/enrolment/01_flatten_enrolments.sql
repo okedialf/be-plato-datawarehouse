@@ -119,11 +119,12 @@ SELECT
     sub.education_class_name                        AS grade,
     sub.school_level,
 
-    -- Enrolment type: use enrolment_type_id first, then fall back to flags
+    -- Enrolment type: sourced from setting_enrolment_types (BASELINE, NEW, CONTINUING, TRANSFER)
+    -- is_repeating_yn and is_returning_yn are additional flags stored on learner_dim,
+    -- not separate enrolment types in the source system.
     CASE
-        WHEN le.is_returning_yn = TRUE              THEN 'RETURNEE'
-        WHEN le.is_repeating_yn = TRUE              THEN 'REPEATER'
-        WHEN set_et.name IS NOT NULL                THEN UPPER(set_et.name)
+        WHEN set_et.name IS NOT NULL THEN UPPER(set_et.name)
+        WHEN le.is_returning_yn = TRUE THEN 'CONTINUING'   -- returnees map to CONTINUING
         ELSE 'CONTINUING'
     END                                             AS enrolment_type,
 
