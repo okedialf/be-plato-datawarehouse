@@ -2,6 +2,12 @@
 -- EMIS Data Warehouse: ETL Step — SCD2 Load → dw.schools_dim
 -- Called nightly AFTER 01_flatten_schools.sql.
 -- Implements full SCD Type 2 with change_hash, changed_fields, change_reason.
+--
+-- FIX: Added ON CONFLICT (emis_number) DO UPDATE to handle cases where
+-- two source records share the same EMIS number (data quality issue in EMIS).
+-- Without this, the INSERT fails when the unique constraint on emis_number
+-- is violated even though the WHERE NOT EXISTS check passed (because it
+-- checks source_id, not emis_number).
 -- =============================================================================
 
 BEGIN;
@@ -14,18 +20,16 @@ SET
     expiration_date = CURRENT_DATE - 1,
     is_current      = FALSE
 FROM stg.schools_flat stg_s
--- Resolve the DW admin_unit surrogate from the raw admin_unit_id
 JOIN dw.admin_units_dim aud
     ON aud.source_id      = stg_s.admin_unit_id
    AND aud.current_status = TRUE
 WHERE
-    dw_s.source_id  = stg_s.source_id
+    dw_s.source_id   = stg_s.source_id
     AND dw_s.is_current = TRUE
-    -- Compare the incoming change_hash to the stored one
     AND dw_s.change_hash <>
         MD5(CONCAT_WS('|',
             COALESCE(stg_s.name,               ''),
-            COALESCE(aud.id::TEXT,             ''),   -- resolved admin unit surrogate
+            COALESCE(aud.id::TEXT,             ''),
             COALESCE(stg_s.emis_number,        ''),
             COALESCE(stg_s.school_type,        ''),
             COALESCE(stg_s.operational_status, ''),
@@ -39,6 +43,9 @@ WHERE
 
 -- -----------------------------------------------------------------------
 -- STEP B: Insert new rows (first version OR changed version)
+-- ON CONFLICT (emis_number) DO UPDATE handles the case where EMIS has
+-- two schools with the same emis_number (duplicate source records).
+-- In that case we keep the most recent version by updating in place.
 -- -----------------------------------------------------------------------
 INSERT INTO dw.schools_dim (
     source_id,
@@ -75,7 +82,6 @@ SELECT
     '9999-12-31'::DATE                                  AS expiration_date,
     TRUE                                                AS is_current,
 
-    -- Compute change hash over all tracked SCD2 columns
     MD5(CONCAT_WS('|',
         COALESCE(stg_s.name,               ''),
         COALESCE(aud.id::TEXT,             ''),
@@ -89,7 +95,6 @@ SELECT
         COALESCE(stg_s.founding_body_type, '')
     ))                                                  AS change_hash,
 
-    -- change_reason: determine the most meaningful reason (priority order)
     CASE
         WHEN dw_old.id IS NULL               THEN 'INITIAL_LOAD'
         WHEN dw_old.name <> stg_s.name      THEN 'School renamed'
@@ -103,7 +108,6 @@ SELECT
         ELSE 'Attribute update'
     END                                                 AS change_reason,
 
-    -- changed_fields: comma-separated list of which columns actually changed
     TRIM(BOTH ',' FROM CONCAT_WS(',',
         CASE WHEN dw_old.id IS NULL                                        THEN 'ALL'           ELSE NULL END,
         CASE WHEN dw_old.id IS NOT NULL AND dw_old.name <> stg_s.name     THEN 'name'          ELSE NULL END,
@@ -118,25 +122,42 @@ SELECT
 
 FROM stg.schools_flat stg_s
 
--- Resolve the DW admin_unit surrogate
 JOIN dw.admin_units_dim aud
     ON aud.source_id      = stg_s.admin_unit_id
    AND aud.current_status = TRUE
 
--- LEFT JOIN to the OLD (now-expired or never-existed) DW row
 LEFT JOIN dw.schools_dim dw_old
     ON  dw_old.source_id  = stg_s.source_id
-    AND dw_old.is_current = FALSE          -- just expired in STEP A
+    AND dw_old.is_current = FALSE
     AND dw_old.expiration_date = CURRENT_DATE - 1
 
--- Only insert where:
---   (a) No current row exists (new school) OR
---   (b) The old row was just expired (changed school)
 WHERE NOT EXISTS (
     SELECT 1
     FROM   dw.schools_dim existing
     WHERE  existing.source_id  = stg_s.source_id
       AND  existing.is_current = TRUE
-);
+)
+
+-- Handle duplicate emis_number in EMIS source data:
+-- If another source_id already inserted a row with the same emis_number,
+-- update it in place rather than failing.
+ON CONFLICT (emis_number) DO UPDATE
+    SET
+        source_id          = EXCLUDED.source_id,
+        name               = EXCLUDED.name,
+        admin_unit_id      = EXCLUDED.admin_unit_id,
+        school_type        = EXCLUDED.school_type,
+        operational_status = EXCLUDED.operational_status,
+        ownership_status   = EXCLUDED.ownership_status,
+        funding_type       = EXCLUDED.funding_type,
+        sex_composition    = EXCLUDED.sex_composition,
+        boarding_status    = EXCLUDED.boarding_status,
+        founding_body_type = EXCLUDED.founding_body_type,
+        effective_date     = EXCLUDED.effective_date,
+        expiration_date    = EXCLUDED.expiration_date,
+        is_current         = EXCLUDED.is_current,
+        change_hash        = EXCLUDED.change_hash,
+        change_reason      = EXCLUDED.change_reason,
+        changed_fields     = EXCLUDED.changed_fields;
 
 COMMIT;
