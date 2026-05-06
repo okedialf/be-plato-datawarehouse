@@ -5,10 +5,8 @@ from datetime import datetime
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
-# Load .env file
 load_dotenv()
 
-# --- LOGGING SETUP ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -19,8 +17,6 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger(__name__)
-
-# --- CONFIGURATION FROM ENV ---
 
 REMOTE_DB = {
     "host":     os.getenv("REMOTE_DB_HOST"),
@@ -38,34 +34,19 @@ LOCAL_DB = {
     "password": os.getenv("LOCAL_DB_PASSWORD")
 }
 
-# --- SOURCE TABLE MAPPINGS ---
-# Format: (remote_table, local_staging_table, fetch_batch_size)
-# None = load all at once (small tables)
-# The SQL ETL scripts handle the heavy JOIN/transform work on the DW side.
-# We only need to bring across the raw source tables here.
+# Only the tables that feed directly into stg.* staging tables.
+# Lookup tables (setting_academic_years etc.) are joined inside the
+# SQL ETL scripts and do not need to be staged separately.
 TABLE_MAPPINGS = [
-    # Small lookup tables — load all at once
-    ("public.setting_academic_years",           "stg.setting_academic_years_raw",           None),
-    ("public.setting_teaching_periods",         "stg.setting_teaching_periods_raw",         None),
-    ("public.setting_education_grades",         "stg.setting_education_grades_raw",         None),
-    ("public.setting_enrolment_types",          "stg.setting_enrolment_types_raw",          None),
-    ("public.academic_year_teaching_periods",   "stg.academic_year_teaching_periods_raw",   None),
-
-    # Medium tables
-    ("public.learner_disabilities",             "stg.learner_disabilities_raw",             50_000),
-
-    # Large tables — stream in batches
-    ("public.learners",                         "stg.learners_raw",                         100_000),
-
-    # Largest table — smallest batch to protect memory
-    ("public.learner_enrolments",               "stg.enrolments_raw",                       50_000),
+    # Medium
+    ("public.learner_disabilities",  "stg.learner_disabilities_raw",  50_000),
+    # Large
+    ("public.learners",              "stg.learners_raw",              100_000),
+    # Largest
+    ("public.learner_enrolments",    "stg.enrolments_raw",            50_000),
 ]
 
-# NOTE: persons data is joined inside 00_extract_enrolment_raw.sql
-# so we do not extract public.persons separately here.
-
-# Enrolment Mart ETL scripts — run in this exact order after extract.
-# Uses autocommit=True so SQL BEGIN/COMMIT are fully in control.
+# ETL SQL scripts — run in order after extract
 ENROLMENT_ETL_SCRIPTS = [
     "sql/05_etl/enrolment/00_extract_enrolment_raw.sql",
     "sql/05_etl/enrolment/01_flatten_enrolments.sql",
@@ -74,11 +55,8 @@ ENROLMENT_ETL_SCRIPTS = [
     "sql/05_etl/enrolment/04_dq_checks_enrolments.sql",
 ]
 
-# How many rows to insert locally per batch
 INSERT_BATCH_SIZE = 10_000
 
-
-# --- FUNCTIONS ---
 
 def get_connection(config, autocommit=False):
     conn = psycopg2.connect(**config)
@@ -99,17 +77,11 @@ def get_row_count(remote_conn, table):
 
 
 def fetch_and_insert(remote_conn, local_conn, remote_table, local_table, batch_size=None):
-    """
-    Stream rows from remote using a server-side named cursor.
-    Inserts locally in batches of INSERT_BATCH_SIZE.
-    Protects 10GB GCP server from OOM on 5M+ row tables.
-    """
     fetch_size = batch_size or 100_000
     columns = get_column_names(remote_conn, remote_table)
     total   = get_row_count(remote_conn, remote_table)
     log.info(f"  Remote rows: {total:,}")
 
-    # Truncate local staging table
     with local_conn.cursor() as cur:
         cur.execute(f"TRUNCATE TABLE {local_table} RESTART IDENTITY CASCADE;")
     local_conn.commit()
@@ -163,7 +135,6 @@ def run_sql_script(conn, script_path):
 
 
 def sync_tables():
-    """Step 1: Extract raw source tables into local staging."""
     remote_conn = get_connection(REMOTE_DB)
     local_conn  = get_connection(LOCAL_DB, autocommit=False)
 
@@ -188,7 +159,6 @@ def sync_tables():
 
 
 def run_enrolment_etl():
-    """Step 2: Run ETL SQL scripts with autocommit=True."""
     local_conn = get_connection(LOCAL_DB, autocommit=True)
 
     try:
@@ -213,8 +183,6 @@ def run_enrolment_etl():
     finally:
         local_conn.close()
 
-
-# --- MAIN ---
 
 if __name__ == "__main__":
     log.info("=" * 60)
