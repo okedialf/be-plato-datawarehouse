@@ -38,10 +38,10 @@ LOCAL_DB = {
 # Lookup tables (setting_academic_years etc.) are joined inside the
 # SQL ETL scripts and do not need to be staged separately.
 TABLE_MAPPINGS = [
-    # Large
-    ("public.learners",           "stg.learners_raw",   100_000),
-    # Largest
-    ("public.learner_enrolments", "stg.enrolments_raw",  50_000),
+    # Only learner_enrolments is extracted via Python.
+    # All other tables (learners, disabilities etc.) are handled
+    # inside 00_extract_enrolment_raw.sql exactly as originally tested.
+    ("public.learner_enrolments", "stg.enrolments_raw", 50_000),
 ]
 
 # ETL SQL scripts — run in order after extract
