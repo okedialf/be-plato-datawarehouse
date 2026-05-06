@@ -40,8 +40,9 @@ LOCAL_DB = {
 
 # --- SOURCE TABLE MAPPINGS ---
 # Format: (remote_table, local_staging_table, fetch_batch_size)
-# Small lookup tables: fetch_batch_size = None (load all at once)
-# Large tables: use batching to avoid memory issues on 10GB GCP server
+# None = load all at once (small tables)
+# The SQL ETL scripts handle the heavy JOIN/transform work on the DW side.
+# We only need to bring across the raw source tables here.
 TABLE_MAPPINGS = [
     # Small lookup tables — load all at once
     ("public.setting_academic_years",           "stg.setting_academic_years_raw",           None),
@@ -54,16 +55,19 @@ TABLE_MAPPINGS = [
     ("public.learner_disabilities",             "stg.learner_disabilities_raw",             50_000),
 
     # Large tables — stream in batches
-    ("public.persons",                          "stg.persons_raw",                          100_000),
     ("public.learners",                         "stg.learners_raw",                         100_000),
 
     # Largest table — smallest batch to protect memory
     ("public.learner_enrolments",               "stg.enrolments_raw",                       50_000),
 ]
 
+# NOTE: persons data is joined inside 00_extract_enrolment_raw.sql
+# so we do not extract public.persons separately here.
+
 # Enrolment Mart ETL scripts — run in this exact order after extract.
-# Uses autocommit=True so SQL BEGIN/COMMIT are fully in control (same as schools).
+# Uses autocommit=True so SQL BEGIN/COMMIT are fully in control.
 ENROLMENT_ETL_SCRIPTS = [
+    "sql/05_etl/enrolment/00_extract_enrolment_raw.sql",
     "sql/05_etl/enrolment/01_flatten_enrolments.sql",
     "sql/05_etl/enrolment/02_scd2_learner_dim.sql",
     "sql/05_etl/enrolment/03_load_enrolment_fact.sql",
@@ -83,14 +87,12 @@ def get_connection(config, autocommit=False):
 
 
 def get_column_names(remote_conn, table):
-    """Get column names for a table from the remote database."""
     with remote_conn.cursor() as cur:
         cur.execute(f"SELECT * FROM {table} LIMIT 0")
         return [desc[0] for desc in cur.description]
 
 
 def get_row_count(remote_conn, table):
-    """Get total row count from remote table."""
     with remote_conn.cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM {table}")
         return cur.fetchone()[0]
@@ -98,20 +100,13 @@ def get_row_count(remote_conn, table):
 
 def fetch_and_insert(remote_conn, local_conn, remote_table, local_table, batch_size=None):
     """
-    Stream rows from remote table using a server-side cursor and insert
-    into local staging table in batches.
-
-    Server-side cursors (named cursors in psycopg2) fetch rows from
-    PostgreSQL in chunks without loading everything into Python memory.
-    This is critical for tables with millions of rows on a 10GB server.
+    Stream rows from remote using a server-side named cursor.
+    Inserts locally in batches of INSERT_BATCH_SIZE.
+    Protects 10GB GCP server from OOM on 5M+ row tables.
     """
     fetch_size = batch_size or 100_000
-
-    # Get column names
     columns = get_column_names(remote_conn, remote_table)
-
-    # Get total count for progress logging
-    total = get_row_count(remote_conn, remote_table)
+    total   = get_row_count(remote_conn, remote_table)
     log.info(f"  Remote rows: {total:,}")
 
     # Truncate local staging table
@@ -120,13 +115,11 @@ def fetch_and_insert(remote_conn, local_conn, remote_table, local_table, batch_s
     local_conn.commit()
     log.info(f"  Truncated {local_table}")
 
-    # Build INSERT query
     cols  = ", ".join(columns)
     query = f"INSERT INTO {local_table} ({cols}) VALUES %s"
 
-    # Stream from remote using named server-side cursor
-    inserted = 0
-    cursor_name = f"cursor_{remote_table.replace('.', '_')}_{datetime.now().strftime('%H%M%S')}"
+    inserted    = 0
+    cursor_name = f"cur_{remote_table.replace('.','_')}_{datetime.now().strftime('%H%M%S')}"
 
     with remote_conn.cursor(name=cursor_name) as server_cur:
         server_cur.execute(f"SELECT * FROM {remote_table}")
@@ -135,7 +128,6 @@ def fetch_and_insert(remote_conn, local_conn, remote_table, local_table, batch_s
         batch = []
         for row in server_cur:
             batch.append(row)
-
             if len(batch) >= INSERT_BATCH_SIZE:
                 with local_conn.cursor() as cur:
                     execute_values(cur, query, batch)
@@ -144,7 +136,6 @@ def fetch_and_insert(remote_conn, local_conn, remote_table, local_table, batch_s
                 log.info(f"  Inserted {inserted:,} / {total:,} rows into {local_table}")
                 batch = []
 
-        # Insert remaining rows
         if batch:
             with local_conn.cursor() as cur:
                 execute_values(cur, query, batch)
@@ -156,13 +147,7 @@ def fetch_and_insert(remote_conn, local_conn, remote_table, local_table, batch_s
 
 
 def run_sql_script(conn, script_path):
-    """
-    Read a .sql file and execute it.
-    Uses autocommit=True so SQL scripts' own BEGIN/COMMIT are in control.
-    Captures NOTICE messages for logging.
-    """
     abs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_path)
-
     if not os.path.exists(abs_path):
         raise FileNotFoundError(f"SQL script not found: {abs_path}")
 
@@ -171,7 +156,6 @@ def run_sql_script(conn, script_path):
 
     with conn.cursor() as cur:
         cur.execute(sql)
-
         if conn.notices:
             for notice in conn.notices:
                 log.info(f"  DB NOTICE: {notice.strip()}")
@@ -179,10 +163,7 @@ def run_sql_script(conn, script_path):
 
 
 def sync_tables():
-    """
-    Step 1: Extract — stream data from EMIS read-only replica into staging.
-    Uses server-side cursors for large tables to protect memory.
-    """
+    """Step 1: Extract raw source tables into local staging."""
     remote_conn = get_connection(REMOTE_DB)
     local_conn  = get_connection(LOCAL_DB, autocommit=False)
 
@@ -190,13 +171,7 @@ def sync_tables():
         for remote_table, local_table, batch_size in TABLE_MAPPINGS:
             log.info(f"Syncing {remote_table} → {local_table}")
             start = datetime.now()
-
-            rows = fetch_and_insert(
-                remote_conn, local_conn,
-                remote_table, local_table,
-                batch_size=batch_size
-            )
-
+            fetch_and_insert(remote_conn, local_conn, remote_table, local_table, batch_size)
             elapsed = (datetime.now() - start).total_seconds()
             log.info(f"  {remote_table} done in {elapsed:.0f}s")
 
@@ -213,10 +188,7 @@ def sync_tables():
 
 
 def run_enrolment_etl():
-    """
-    Step 2: Transform & Load — run Enrolment Mart ETL SQL scripts.
-    Uses autocommit=True so SQL scripts' BEGIN/COMMIT are fully in control.
-    """
+    """Step 2: Run ETL SQL scripts with autocommit=True."""
     local_conn = get_connection(LOCAL_DB, autocommit=True)
 
     try:
@@ -224,9 +196,7 @@ def run_enrolment_etl():
             script_name = os.path.basename(script_path)
             log.info(f"Running ETL script: {script_name}")
             start = datetime.now()
-
             run_sql_script(local_conn, script_path)
-
             elapsed = (datetime.now() - start).total_seconds()
             log.info(f"  {script_name} completed in {elapsed:.1f}s")
 
@@ -253,8 +223,8 @@ if __name__ == "__main__":
     log.info("=" * 60)
 
     try:
-        sync_tables()           # Extract: remote → staging tables
-        run_enrolment_etl()     # Transform & Load: staging → dw
+        sync_tables()
+        run_enrolment_etl()
 
         log.info("=" * 60)
         log.info("ALL STEPS COMPLETED SUCCESSFULLY")
